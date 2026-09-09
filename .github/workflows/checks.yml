@@ -1,0 +1,138 @@
+name: checks
+
+# This repository is PUBLIC and its tracked files are served RAW to end users:
+# the install one-liner curls install.sh / install.ps1 from HEAD, and the
+# documentation is read straight from the default branch. So the checks that
+# belong here are the ones that catch a file which is broken or unsafe FOR A
+# READER: a dead link, a plaintext URL, a mangled encoding, a missing document.
+#
+# WHAT DELIBERATELY DOES NOT LIVE HERE: the triage of internal identifiers.
+# A scanner whose list of forbidden patterns is the secret publishes the secret,
+# labelled and organised, to everyone who can read this repository. That triage
+# runs in the private repository where the content is written, before anything
+# reaches this tree.
+#
+# Everything published here is generated from that private source and arrives
+# through the release pipeline, so a finding in this workflow means the source
+# needs fixing, not this tree.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: public tree checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required documents are present
+        shell: bash
+        run: |
+          set -uo pipefail
+          missing=0
+          for f in README.md README.pt-BR.md USER-MANUAL.md LICENSE.md TRADEMARKS.md \
+                   SECURITY.md PRIVACY.md SUPPORT.md THIRD_PARTY_NOTICES.md \
+                   install.ps1 install.sh; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::required public document is missing"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 0 ]; then echo "OK: every required document is present"; fi
+          exit "$missing"
+
+      - name: Relative links resolve
+        shell: bash
+        run: |
+          set -uo pipefail
+          broken=0
+          # Only same-directory relative links are used in this tree, so a link
+          # that does not resolve is a mistake worth failing on. The match is
+          # extracted per file because grep -o drops the file name.
+          while IFS= read -r file; do
+            while IFS= read -r target; do
+              [ -n "$target" ] || continue
+              if [ ! -f "$target" ]; then
+                echo "::error file=$file::relative link to a missing file: $target"
+                broken=1
+              fi
+            done < <(grep -oE ']\(\./[A-Za-z0-9_.-]+\)' "$file" \
+                     | sed -E 's/^]\(\.\///; s/\)$//' | sort -u)
+          done < <(git ls-files '*.md')
+          if [ "$broken" -eq 0 ]; then echo "OK: every relative link resolves"; fi
+          exit "$broken"
+
+      - name: Every URL we wrote is HTTPS
+        shell: bash
+        run: |
+          set -uo pipefail
+          # A plaintext URL in a document that tells someone how to install
+          # software is a downgrade waiting to happen.
+          #
+          # Two exemptions, both because the URL is not ours to change:
+          # THIRD_PARTY_NOTICES.md is verbatim third-party license text, and the
+          # canonical Apache-2.0 and MPL-2.0 URLs are plaintext inside the
+          # licenses themselves; loopback addresses are documented on purpose.
+          hits=$(git ls-files '*.md' '*.sh' '*.ps1' \
+                 | grep -v '^THIRD_PARTY_NOTICES.md$' \
+                 | xargs -r grep -nE 'http://' \
+                 | grep -vE 'http://(localhost|127\.0\.0\.1)' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::plaintext http:// URL in a public document"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no plaintext http:// URLs"
+
+      - name: Encoding is clean
+        shell: bash
+        run: |
+          set -uo pipefail
+          bad=0
+          while IFS= read -r f; do
+            if head -c 3 "$f" | grep -q $'\xEF\xBB\xBF'; then
+              echo "::error file=$f::file starts with a UTF-8 BOM"
+              bad=1
+            fi
+            if file "$f" | grep -q CRLF; then
+              echo "::error file=$f::file has CRLF line endings"
+              bad=1
+            fi
+            if ! iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::file is not valid UTF-8"
+              bad=1
+            fi
+          done < <(git ls-files '*.md' '*.sh' '*.ps1')
+          if [ "$bad" -eq 0 ]; then echo "OK: UTF-8, no BOM, LF endings"; fi
+          exit "$bad"
+
+      - name: install.sh parses
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This file is executed by a one-liner straight from this branch. A
+          # syntax error here is a broken install for everyone, immediately.
+          sh -n install.sh
+          echo "OK: install.sh parses"
+
+      - name: install.ps1 parses
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error file=install.ps1::$($_.Message)" }
+            exit 1
+          }
+          Write-Host 'OK: install.ps1 parses'
